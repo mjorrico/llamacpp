@@ -1,0 +1,76 @@
+x-gpu: &gpu
+  image: ghcr.io/ggml-org/llama.cpp:server-cuda
+  # image: ghcr.io/ggml-org/llama.cpp:server
+  restart: unless-stopped
+  environment:
+    # Gates every endpoint except /health, /v1/health and the built-in web UI:
+    # callers must send "Authorization: Bearer $LLAMA_API_KEY" (X-Api-Key also
+    # works). The ":?" is load-bearing -- llama.cpp treats an empty key list as
+    # "no auth" and serves everything unauthenticated, so make compose refuse
+    # to start rather than silently come up open.
+    LLAMA_API_KEY: ${LLAMA_API_KEY:?set LLAMA_API_KEY in llamacpp/.env}
+  volumes:
+    - ./models:/models
+  ports:
+    - "8199:8080"
+  networks:
+    llama_network:
+      # Both profiles answer to "llama", so consumers on this network keep one
+      # base_url across an llm/embed swap instead of tracking which
+      # container_name is currently up.
+      aliases:
+        - llama
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+# Only one of these can run at a time - they share the GPU and port 8199.
+# Neither has a default profile, so a bare `docker compose up` starts nothing.
+#
+#   docker compose --profile llm   up -d --remove-orphans
+#   docker compose --profile embed up -d --remove-orphans
+#
+# --remove-orphans is what tears down the other one: a service whose profile
+# is not active counts as an orphan, so the swap is a single command.
+services:
+  llama-server:
+    <<: *gpu
+    profiles: ["llm"]
+    container_name: llama-server
+    command: >
+      -m /models/Qwen3.5-4B-Q4_K_M.gguf
+      --port 8080
+      -n -1
+      -ngl 99
+      -np 8
+      -c 65536
+      --kv-unified
+
+  llama-embed:
+    <<: *gpu
+    profiles: ["embed"]
+    container_name: llama-embed
+    # Pooling is read from the GGUF metadata (LAST). -ub must be >= the longest
+    # input, since a pooled sequence has to fit in a single ubatch; -c is
+    # 4 slots x 2048 tokens.
+    command: >
+      --embeddings
+      -m /models/harrier-oss-v1-270M-Q4_K_M.gguf
+      -a harrier-270m
+      --port 8080
+      -ngl 99
+      -np 16
+      -c 32768
+      -b 8192
+      -ub 2048
+
+# Owned here, joined elsewhere as `external: true`. The explicit name is
+# load-bearing: without it compose would prefix the project and create
+# "llamacpp_llama_network", which external consumers would fail to find.
+networks:
+  llama_network:
+    name: llama_network
